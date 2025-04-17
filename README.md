@@ -18,6 +18,13 @@ skeleton and the nearest intersection point on the radicle.  The actual length m
 computed from the geodesic distance between these two points, providing a robust and accurate
 metric.
 
+We also developed a semi-automated data annotation tool which utilizes the power of YOLO and SAM to
+help researchers conduct to deep learning annotation works,
+[Label-SAM](https://github.com/cccccabbage/label-sam), as inspired by this project.
+Label-SAM automates most of the annotation process, while also allowing users to manually refine
+annotations as needed, ensuring both annotation accuracy and flexibility. Feel free to try it as
+well.
+
 ## Key Features:
 
 - **Universal Application**: Designed for use across diverse crop species.
