@@ -1,47 +1,55 @@
 import models
 import gaussian as gs
 
+import os
 import cv2
 import networkx as nx
 import numpy as np
 from skimage import measure, morphology
 
-def _wholeProcess(img, yolo, sam):
+def _writeBool(mask:np.ndarray, path:str):
+    mask = mask.astype(np.uint8) * 255
+    cv2.imwrite(path, mask)
+
+def _wholeProcess(img, yolo, sam, imgName):
+    saveFolder = "output/" + imgName.split(".")[0]
     masks, boxes = models.getMasksAndBoxes(img, yolo, sam)
-    gsResults = gs.gaussianLabel(img, masks, boxes, normalize=True, erode=True, dilate=True, labelWhole=False)
+    boxImg = img.copy()
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        cv2.rectangle(boxImg, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.imwrite(f"{saveFolder}/box.png", boxImg)
+
+    gsResults = gs.gaussianLabel(img, masks, boxes, normalize=True, erode=True, dilate=True)
 
     points = []
-    indices = [] # store the index for rice points and bud points from one instance
+    labels = []
     for rice, bud in zip(gsResults.rices, gsResults.buds):
-        idx = [-1, -1]
+        point = [[-1,  -1], [-1, -1]]
+        label = [-1, -1]
         if rice.notEmpty:
-            points.append(rice.point)
-            idx[0] = len(points) - 1
+            point[0] = rice.point
+            label[0] = 1
         if bud.notEmpty:
-            points.append(bud.point)
-            idx[1] = len(points) - 1
-        indices.append(tuple(idx))
+            point[1] = bud.point
+            label[1] = 1
+        points.append(point)
+        labels.append(label)
 
-    labels = [0] * len(points)
     masks = models.getMasksByPoints(img, sam, points, labels)
 
+    ricePoints = []
     canvas = img.copy()
     for p in points:
-        cv2.circle(canvas, tuple(p), 3, (0, 0, 255), -1)
-    cv2.imwrite("output/points.jpg", canvas)
-
-    # fuse masks from one instance to one mask
-    fuseMasks = []
-    for (riceIdx, budIdx) in indices:
-        riceMask = masks[riceIdx] if riceIdx != -1 else np.zeros_like(riceMask, dtype=bool)
-        budMask = masks[budIdx] if budIdx != -1 else np.zeros_like(riceMask, dtype=bool)
-        fuseMask = riceMask | budMask
-        assert np.sum(fuseMask) != 0
-        fuseMasks.append(fuseMask)
-    masks = np.array(fuseMasks)
+        if p[0][0] != -1:
+            cv2.circle(canvas, tuple(p[0]), 3, (0, 255, 0), -1) # green
+            ricePoints.append(p[0])
+        if p[1][0] != -1:
+            cv2.circle(canvas, tuple(p[1]), 3, (0, 0, 255), -1) # red
+    cv2.imwrite(f"{saveFolder}/points.png", canvas)
 
     # classify the masks of instances to rice and bud
-    gsResults = gs.gaussianLabel(img, masks, boxes, normalize=True, erode=True, dilate=True)
+    gsResults = gs.gaussianLabel2(img, masks, ricePoints, normalize=True, erode=True, dilate=True, conf=0.006)
 
     return gsResults
 
@@ -93,7 +101,9 @@ def __build_graph(points):
 
     return G
 
-def getLen(riceSkl: np.ndarray, budSkl: np.ndarray) -> float:
+def getLen(riceSkl: np.ndarray | None, budSkl: np.ndarray | None) -> float:
+    if riceSkl is None or budSkl is None:
+        return 0.0
     budSkl = budSkl.astype(np.uint8)
 
     convolved = cv2.filter2D(budSkl, -1, kernel)
@@ -157,16 +167,20 @@ def __CalcuateLength(gsResults: gs.GaussianResult, retSkl=False) -> list[tuple[i
 
     lengths = []
     for i in range(len(gsResults.insMasks)):
-        budSklFull  = __getSkl(gsResults.buds[i].mask)
-        riceSklFull = __getSkl(gsResults.rices[i].mask)
+        riceSklFull = None
+        budSklFull = None
+        if gsResults.rices[i].notEmpty:
+            riceSklFull = __getSkl(gsResults.rices[i].mask[0])
+        if gsResults.buds[i].notEmpty:
+            budSklFull = __getSkl(gsResults.buds[i].mask[0])
 
         length = getLen(riceSklFull, budSklFull)
 
         lengths.append((i, length))
 
         if retSkl:
-            riceSkl = riceSkl | riceSklFull
-            budSkl = budSkl | budSklFull
+            riceSkl = (riceSkl | riceSklFull) if riceSklFull is not None else riceSkl
+            budSkl  = (budSkl  | budSklFull) if budSklFull is not None else budSkl
 
     if retSkl:
         return lengths, (riceSkl, budSkl)
@@ -213,22 +227,28 @@ def computeOneLength(imgPath, pix2mm, yolo, sam):
     img = cv2.imread(imgPath)
     img = cv2.resize(img, (1920, 1080))
     imgName = imgPath.split("/")[-1].replace(".jpg", ".png")
-    gsResults = _wholeProcess(img, yolo, sam)
+    saveFolder = "output/" + imgName.split(".")[0]
+    os.makedirs(saveFolder, exist_ok=True)
+    gsResults = _wholeProcess(img, yolo, sam, imgName=imgName)
 
     canvas = img.copy()
     budMask = gsResults.allBudMasks()
     riceMask = gsResults.allRiceMasks()
-    canvas[budMask] = (0, 0, 255)
-    canvas[riceMask] = (0, 255, 0)
-    cv2.imwrite("output/mask-" + imgName, canvas)
+    canvas[riceMask[0]] = (0, 255, 0) # green
+    canvas[ budMask[0]] = (0, 0, 255) # red
+    cv2.imwrite(f"{saveFolder}/mask.png", canvas)
 
     lengths, (riceSkl, budSkl) = __CalcuateLength(gsResults, retSkl=True)
     sklImg = img.copy()
-    sklImg[budSkl] = (0, 0, 255)
-    sklImg[riceSkl] = (0, 255, 0)
-    cv2.imwrite("output/skl-" + imgName, sklImg)
+    sklImg[ budSkl[0]] = (0, 0, 255)
+    sklImg[riceSkl[0]] = (0, 255, 0)
+    cv2.imwrite(f"{saveFolder}/skl.png", sklImg)
 
     lengths = [x[1] * pix2mm for x in lengths]
 
-    print("mean(mm): ", np.mean(lengths))
-    print("std(mm): ", np.std(lengths))
+    if pix2mm == 1.0:
+        print("mean(pix): ", np.mean(lengths))
+        print("std (pix): ", np.std(lengths))
+    else:
+        print("mean(mm): ", np.mean(lengths))
+        print("std (mm): ", np.std(lengths))

@@ -1,6 +1,11 @@
 import cv2
 import numpy as np
 from skimage import morphology, measure
+from scipy.ndimage import label
+
+def _writeBool(mask:np.ndarray, path:str):
+    mask = mask.astype(np.uint8) * 255
+    cv2.imwrite(path, mask)
 
 class LabelResult:
     def __init__(self, point, mask):
@@ -23,10 +28,10 @@ class GaussianResult:
         return f"instance count: {len(self.insMasks)}"
     
     def allBudMasks(self):
-        return np.sum([bud.mask for bud in self.buds], axis=0, dtype=float).astype(bool)
+        return np.sum([bud.mask for bud in self.buds if bud.notEmpty], axis=0, dtype=float).astype(bool)
 
     def allRiceMasks(self):
-        return np.sum([rice.mask for rice in self.rices], axis=0, dtype=float).astype(bool)
+        return np.sum([rice.mask for rice in self.rices if rice.notEmpty], axis=0, dtype=float).astype(bool)
 
 
 def _disk5():
@@ -53,19 +58,14 @@ def _disk5():
 
 
 def _removeSmall(oneMask):
-    # used to remove small area of noise in the mask
-    oneMask = oneMask.astype(np.uint8) * 255
-    props = measure.regionprops(measure.label(oneMask))
-    props = sorted(props, key=lambda x: x.area, reverse=True)
-
-    removedParts = np.zeros_like(oneMask, dtype=bool)
-    for i in range(len(props)):
-        if i == 0: continue
-        prop = props[i]
-        removedParts[prop.coords[:, 0], prop.coords[:, 1]] = True
-
-    oneMask = oneMask & (~removedParts)
-    return oneMask, removedParts
+    # remove small area of noise in the mask
+    m = oneMask.astype(np.uint8)
+    labeled_mask, num_features = label(m)
+    sizes = np.bincount(labeled_mask.ravel())
+    sizes[0] = 0
+    largest_label = sizes.argmax()
+    largest_componetn = (labeled_mask == largest_label).astype(bool)
+    return largest_componetn
 
 
 def _normalize(mat):
@@ -77,19 +77,19 @@ def _normalize(mat):
 #   masks: np.array of shape (N, H, W), where N stands for the number of instances
 # return:
 #   GaussianResult
-def gaussianLabel(img, masks, boxes, normalize=False, erode=True, dilate=False, labelWhole=True, conf=0.006):
+def gaussianLabel(img, masks, boxes, normalize=False, erode=True, dilate=False, conf=0.006):
     img = img.astype(float)
     if np.max(img) <= 1.0:
         img = img * 255.0
 
     wholeMask = np.sum(masks, axis=0, dtype=float).astype(bool).astype(np.uint8) * 255
+    wholeMask = wholeMask[0]
 
     if erode:
         kernel = _disk5()
         mask_eroded = cv2.erode(wholeMask, kernel, iterations=1).astype(bool)
     else:
         mask_eroded = np.ones_like(wholeMask, dtype=bool)
-    wholeMask = wholeMask.astype(bool)
 
     # preserve the masks inside the boxes
     boxMask = np.zeros_like(wholeMask, dtype=bool)
@@ -133,10 +133,7 @@ def gaussianLabel(img, masks, boxes, normalize=False, erode=True, dilate=False, 
     meanVec = np.mean(repPoints, axis=0)
     invCovMatrix = np.linalg.inv(np.cov(repPoints, rowvar=False))
 
-    if labelWhole:
-        maskToLabel = wholeMask
-    else:
-        maskToLabel = mask_eroded
+    maskToLabel = mask_eroded
 
     # compute the probability of each pixel inside the mask
     indices = np.where(maskToLabel)
@@ -168,15 +165,8 @@ def gaussianLabel(img, masks, boxes, normalize=False, erode=True, dilate=False, 
         oneRiceMask = riceMask & mask
         oneBudMask = oneBudMask & (~oneRiceMask)
 
-        # remove small area
-        oneBudMask, removedParts = _removeSmall(oneBudMask)
-        oneRiceMask = oneRiceMask | removedParts
-        oneRiceMask, removedParts = _removeSmall(oneRiceMask)
-        oneBudMask = oneBudMask | removedParts
-        oneBudMask, removedParts = _removeSmall(oneBudMask)
-        oneRiceMask = oneRiceMask | removedParts
-        oneRiceMask, removedParts = _removeSmall(oneRiceMask)
-        oneBudMask = oneBudMask | removedParts
+        oneBudMask = _removeSmall(oneBudMask)
+        oneRiceMask = _removeSmall(oneRiceMask)
 
         budCenter = maskCenter(oneBudMask)
         riceCenter = maskCenter(oneRiceMask)
@@ -185,11 +175,93 @@ def gaussianLabel(img, masks, boxes, normalize=False, erode=True, dilate=False, 
 
     return results
 
+# input:
+#   img: np.array of shape (H, W, 3)
+#   masks: np.array of shape (N, H, W), where N stands for the number of instances
+#   points: np.array of shape (N, 2), where N stands for the number of instances
+# return:
+#   GaussianResult
+def gaussianLabel2(img, masks, points, normalize=False, erode=True, dilate=False, conf=0.006):
+    img = img.astype(float)
+    if np.max(img) <= 1.0:
+        img = img * 255.0
+
+    wholeMask = np.sum(masks, axis=0, dtype=float).astype(bool).astype(np.uint8) * 255
+    wholeMask = wholeMask[0]
+
+    if erode:
+        kernel = _disk5()
+        mask_eroded = cv2.erode(wholeMask, kernel, iterations=1).astype(bool)
+    else:
+        mask_eroded = np.ones_like(wholeMask, dtype=bool)
+
+    # format r-b and g-b data
+    b, g, r = cv2.split(img)
+    rbgb = img[..., :2].copy()
+    if normalize:
+        rbgb[..., 0] = _normalize(r - b)
+        rbgb[..., 1] = _normalize(g - b)
+    else:
+        rbgb[..., 0] = r - b
+        rbgb[..., 1] = g - b
+
+    # select the representative points and compute the mean vector and inverse covariance matrix
+    repPoints = [] # representative points
+    for centroid in points:
+        lt = (int(centroid[1]-1), int(centroid[0]-1))
+        rb = (int(centroid[1]+2), int(centroid[0]+2))
+
+        rbVal = rbgb[lt[1]:rb[1], lt[0]:rb[0], 0].ravel()
+        gbVal = rbgb[lt[1]:rb[1], lt[0]:rb[0], 1].ravel()
+        repPoints.append(np.column_stack((rbVal, gbVal)))
+    repPoints = np.vstack(repPoints)
+    meanVec = np.mean(repPoints, axis=0)
+    invCovMatrix = np.linalg.inv(np.cov(repPoints, rowvar=False))
+
+    maskToLabel = wholeMask.astype(bool)
+
+    # compute the probability of each pixel inside the mask
+    indices = np.where(maskToLabel)
+    rbgb = rbgb[indices] # shape = (n, 2)
+    probs = np.zeros_like(maskToLabel, dtype=float)
+    for i in range(len(indices[0])):
+        diffVector = rbgb[i] - meanVec
+        prob = np.exp(-0.5 * (diffVector.T @ invCovMatrix @ diffVector))
+        probs[indices[0][i], indices[1][i]] = prob
+    probs = probs >= conf
+
+    # format bud labels and rice labels
+    budMask = (~probs) & maskToLabel
+    riceMask = (probs) & maskToLabel
+
+    if erode and dilate:
+        riceMask = riceMask.astype(np.uint8) * 255
+        riceMask = cv2.dilate(riceMask, kernel, iterations=1).astype(bool)
+
+    # remove small area
+    results = GaussianResult()
+    results.insMasks = masks
+    for mask in masks:
+        oneBudMask = budMask & mask
+        oneRiceMask = riceMask & mask
+        oneBudMask = oneBudMask & (~oneRiceMask)
+
+        oneBudMask = _removeSmall(oneBudMask)
+        oneRiceMask = _removeSmall(oneRiceMask)
+
+        budCenter = maskCenter(oneBudMask)
+        riceCenter = maskCenter(oneRiceMask)
+        results.buds.append(LabelResult(riceCenter, oneRiceMask))
+        results.rices.append(LabelResult(budCenter, oneBudMask))
+
+    return results
+
 
 # input mask: np.array of shape (H, W)
 # notice: the input mask must be a mask of one instance
 def maskCenter(mask: np.array):
-    properties = measure.regionprops(measure.label(mask))
+    assert len(mask) == 1
+    properties = measure.regionprops(measure.label(mask[0]))
 
     if len(properties) == 0:
         return (-1, -1)

@@ -1,3 +1,4 @@
+import cv2
 import models
 import compute
 import argparse
@@ -17,8 +18,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    yolo = models.getYOLO(args.yoloPath)
-    sam = models.getSAM(args.samPath)
+    yolo = models.getYOLO(args.yolo)
+    sam = models.getSAM(args.sam)
+
+    generatedImgs = [
+        f"output/{args.img.split("/")[-1].split(".")[0]}/{f}.png"
+        for f in ["box", "points", "mask", "skl"]
+    ]
 
     if args.markImg is not None:
         assert args.markArea is not None
@@ -30,4 +36,23 @@ if __name__ == "__main__":
             raise ValueError("either markImg and markArea or pix2mm must be provided")
         pix2mm = args.pix2mm
 
-    compute.computeOneLength(args.imgPath, pix2mm, yolo, sam)
+    compute.computeOneLength(args.img, pix2mm, yolo, sam)
+
+    window_name = "imgs"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    for img_path in generatedImgs:
+        img = cv2.imread(img_path)
+
+        # Resize image to 1280x720
+        img = cv2.resize(img, (1280, 720))
+
+        # Show image
+        cv2.imshow(window_name, img)
+
+        # Set window title dynamically
+        cv2.setWindowTitle(window_name, f"Slideshow - {img_path}")
+
+        cv2.waitKey(2000)  # 1 second
+
+    cv2.destroyAllWindows()
